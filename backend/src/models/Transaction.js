@@ -9,6 +9,10 @@ const transactionSchema = new mongoose.Schema({
   type: { type: String, enum: ['received', 'sent', 'swap', 'topup'], required: true },
   status: { type: String, enum: ['completed', 'pending', 'failed', 'blocked'], default: 'completed' },
   riskScore: { type: Number, default: 10, min: 0, max: 100 },
+  fraudDecision: { type: String, enum: ['APPROVE', 'REVIEW', 'BLOCK'], default: 'APPROVE' },
+  fraudReasons: [{ type: String }],
+  fraudExplanation: { type: String },
+  reviewRequired: { type: Boolean, default: false },
   deviceIp: { type: String },
   createdAt: { type: Date, default: Date.now }
 });

@@ -6,6 +6,17 @@ const userSchema = new mongoose.Schema({
   email: { type: String, required: true, unique: true, lowercase: true, trim: true },
   password: { type: String, required: true },
   role: { type: String, enum: ['user', 'admin', 'analyst'], default: 'user' },
+  isVerified: { type: Boolean, default: false },
+  emailVerificationToken: { type: String },
+  emailVerificationExpires: { type: Date },
+  passwordResetToken: { type: String },
+  passwordResetExpires: { type: Date },
+  refreshTokens: [
+    {
+      tokenHash: { type: String },
+      expiresAt: { type: Date }
+    }
+  ],
   twoFactorEnabled: { type: Boolean, default: false },
   deviceTrustScore: { type: Number, default: 95, min: 0, max: 100 },
   lastLogin: { type: Date },

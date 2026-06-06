@@ -2,12 +2,15 @@ import Transaction from '../models/Transaction.js';
 import Wallet from '../models/Wallet.js';
 import User from '../models/User.js';
 import ThreatLog from '../models/ThreatLog.js';
+import FraudDecision from '../models/FraudDecision.js';
+import { evaluateTransactionRisk } from '../services/fraudService.js';
+import { recordAudit } from '../services/auditService.js';
 import mongoose from 'mongoose';
 
 export const createTransaction = async (req, res, next) => {
-  const { recipientEmail, amount, type } = req.body;
+  const { recipientEmail, amount } = req.body;
   const session = await mongoose.startSession();
-  
+
   try {
     session.startTransaction();
 
@@ -28,82 +31,121 @@ export const createTransaction = async (req, res, next) => {
       throw new Error('Recipient wallet not found');
     }
 
-    // Dynamic Risk Simulation
-    let riskScore = 10;
-    let isBlocked = false;
-    
-    if (amount > 10000) {
-      riskScore = 85; // High transaction pattern threshold
-    } else if (amount > 5000) {
-      riskScore = 45; // Medium
-    }
+    const fraudResult = await evaluateTransactionRisk({
+      user: sender,
+      senderWallet,
+      recipient,
+      amount,
+      ip: req.ip
+    });
 
-    // High risk trigger blocking transaction and logging a threat
-    if (riskScore >= 80) {
-      isBlocked = true;
-      await ThreatLog.create([{
-        userId: sender._id,
-        type: 'Blocked',
-        severity: 'high',
-        message: `High risk transaction of $${amount} to ${recipient.name} blocked due to anomalous amount size.`,
-        time: 'Just now'
-      }], { session });
-
-      await Transaction.create([{
-        senderId: sender._id,
-        recipientId: recipient._id,
-        senderName: sender.name,
-        recipientName: recipient.name,
-        amount,
-        type: 'sent',
-        status: 'blocked',
-        riskScore,
-        deviceIp: req.ip
-      }], { session });
-
-      await session.commitTransaction();
-      session.endSession();
-      return res.status(400).json({ message: 'Transaction blocked by fraud engine risk validation.', riskScore });
-    }
-
-    // Perform atomic transaction updates
-    senderWallet.balance -= Number(amount);
-    recipientWallet.balance += Number(amount);
-    
-    await senderWallet.save({ session });
-    await recipientWallet.save({ session });
-
-    const newTx = await Transaction.create([{
+    const transactionData = {
       senderId: sender._id,
       recipientId: recipient._id,
       senderName: sender.name,
       recipientName: recipient.name,
       amount,
       type: 'sent',
-      status: 'completed',
-      riskScore,
-      deviceIp: req.ip
-    }], { session });
+      fraudDecision: fraudResult.finalDecision,
+      fraudReasons: fraudResult.triggeredRules.map((rule) => rule.ruleName),
+      fraudExplanation: fraudResult.explanationSummary,
+      reviewRequired: fraudResult.finalDecision === 'REVIEW',
+      riskScore: fraudResult.riskScore,
+      deviceIp: req.ip,
+      status: fraudResult.finalDecision === 'BLOCK' ? 'blocked' : fraudResult.finalDecision === 'REVIEW' ? 'pending' : 'completed'
+    };
 
-    // Also Log warning threat if transaction was moderately risky
-    if (riskScore >= 40) {
+    const [newTx] = await Transaction.create([transactionData], { session });
+    await FraudDecision.create([
+      {
+        userId: sender._id,
+        transactionId: newTx._id,
+        decision: fraudResult.decision,
+        finalDecision: fraudResult.finalDecision,
+        riskScore: fraudResult.riskScore,
+        triggeredRules: fraudResult.triggeredRules,
+        explanationSummary: fraudResult.explanationSummary,
+        explanation: fraudResult.explanation,
+        context: fraudResult.context
+      }
+    ], { session });
+
+    if (fraudResult.finalDecision === 'BLOCK') {
       await ThreatLog.create([{
         userId: sender._id,
-        type: 'Warning',
-        severity: 'medium',
-        message: `Unusual transaction size of $${amount} triggered warning rules logic.`,
+        transactionId: newTx._id,
+        type: 'Blocked',
+        severity: 'high',
+        message: `Blocked transaction of $${amount} to ${recipient.name} due to fraud risk score ${fraudResult.riskScore}.`,
         time: 'Just now'
       }], { session });
+
+      await session.commitTransaction();
+      session.endSession();
+
+      await recordAudit({
+        actorId: sender._id,
+        action: 'TRANSACTION_BLOCKED',
+        resourceType: 'Transaction',
+        resourceId: newTx._id,
+        details: { amount, recipientEmail, decision: fraudResult.finalDecision, riskScore: fraudResult.riskScore },
+        ip: req.ip,
+        userAgent: req.headers['user-agent']
+      });
+
+      return res.status(403).json({ message: 'Transaction blocked by fraud engine risk validation.', riskScore: fraudResult.riskScore });
     }
+
+    if (fraudResult.finalDecision === 'REVIEW') {
+      await ThreatLog.create([{
+        userId: sender._id,
+        transactionId: newTx._id,
+        type: 'Warning',
+        severity: 'medium',
+        message: `Transaction of $${amount} to ${recipient.name} flagged for review due to risk score ${fraudResult.riskScore}.`,
+        time: 'Just now'
+      }], { session });
+
+      await session.commitTransaction();
+      session.endSession();
+
+      await recordAudit({
+        actorId: sender._id,
+        action: 'TRANSACTION_REVIEW_REQUIRED',
+        resourceType: 'Transaction',
+        resourceId: newTx._id,
+        details: { amount, recipientEmail, decision: fraudResult.finalDecision, riskScore: fraudResult.riskScore },
+        ip: req.ip,
+        userAgent: req.headers['user-agent']
+      });
+
+      return res.status(202).json({ message: 'Transaction requires review before completion.', riskScore: fraudResult.riskScore });
+    }
+
+    senderWallet.balance -= Number(amount);
+    recipientWallet.balance += Number(amount);
+
+    await senderWallet.save({ session });
+    await recipientWallet.save({ session });
 
     await session.commitTransaction();
     session.endSession();
 
-    res.status(201).json(newTx[0]);
+    await recordAudit({
+      actorId: sender._id,
+      action: 'TRANSACTION_APPROVED',
+      resourceType: 'Transaction',
+      resourceId: newTx._id,
+      details: { amount, recipientEmail, riskScore: fraudResult.riskScore },
+      ip: req.ip,
+      userAgent: req.headers['user-agent']
+    });
+
+    res.status(201).json(newTx);
   } catch (err) {
     await session.abortTransaction();
     session.endSession();
-    res.status(400).json({ message: err.message });
+    next(err);
   }
 };
 
@@ -113,18 +155,19 @@ export const getTransactions = async (req, res, next) => {
       $or: [{ senderId: req.user.id }, { recipientId: req.user.id }]
     }).sort({ createdAt: -1 });
 
-    // Map transaction type indicator relative to who is asking
-    const relativeTxs = txs.map(tx => {
+    const relativeTxs = txs.map((tx) => {
       const type = tx.senderId.toString() === req.user.id ? 'sent' : 'received';
       const name = type === 'sent' ? tx.recipientName : tx.senderName;
-      
+
       return {
         id: tx._id,
         type,
         name,
         amount: type === 'sent' ? -tx.amount : tx.amount,
         time: tx.createdAt,
-        status: tx.status
+        status: tx.status,
+        fraudDecision: tx.fraudDecision,
+        fraudReasons: tx.fraudReasons
       };
     });
 
