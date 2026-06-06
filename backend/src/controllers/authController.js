@@ -1,7 +1,7 @@
 import User from '../models/User.js';
 import Wallet from '../models/Wallet.js';
 import jwt from 'jsonwebtoken';
-import { hashToken, generateRandomToken } from '../utils/tokenUtils.js';
+import { hashToken, generateRandomToken, createRefreshTokenJwt, verifyRefreshTokenJwt } from '../utils/tokenUtils.js';
 import { sendEmail } from '../utils/emailService.js';
 import { recordAudit } from '../services/auditService.js';
 
@@ -14,8 +14,10 @@ const createAccessToken = (id) => {
   });
 };
 
-const createRefreshToken = async (user) => {
-  const refreshToken = generateRandomToken();
+const isJwtToken = (token) => typeof token === 'string' && token.split('.').length === 3;
+
+export const createRefreshToken = async (user) => {
+  const refreshToken = createRefreshTokenJwt(user._id);
   const tokenHash = hashToken(refreshToken);
   const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
 
@@ -24,6 +26,18 @@ const createRefreshToken = async (user) => {
   await user.save();
 
   return refreshToken;
+};
+
+export const rotateRefreshToken = async (user, refreshToken) => {
+  const refreshTokenHash = hashToken(refreshToken);
+  user.refreshTokens = user.refreshTokens.filter((item) => item.tokenHash !== refreshTokenHash && item.expiresAt > new Date());
+  return await createRefreshToken(user);
+};
+
+export const revokeRefreshToken = async (user, refreshToken) => {
+  const refreshTokenHash = hashToken(refreshToken);
+  user.refreshTokens = user.refreshTokens.filter((item) => item.tokenHash !== refreshTokenHash);
+  await user.save();
 };
 
 const setRefreshTokenCookie = (res, refreshToken) => {
@@ -170,8 +184,11 @@ export const refreshToken = async (req, res, next) => {
       return res.status(401).json({ message: 'Invalid or expired refresh token' });
     }
 
-    user.refreshTokens = user.refreshTokens.filter((item) => item.tokenHash !== refreshTokenHash && item.expiresAt > new Date());
-    const newRefreshToken = await createRefreshToken(user);
+    if (isJwtToken(refreshToken)) {
+      verifyRefreshTokenJwt(refreshToken);
+    }
+
+    const newRefreshToken = await rotateRefreshToken(user, refreshToken);
     setRefreshTokenCookie(res, newRefreshToken);
 
     await recordAudit({
@@ -186,6 +203,9 @@ export const refreshToken = async (req, res, next) => {
 
     res.json({ token: createAccessToken(user._id) });
   } catch (err) {
+    if (err.name === 'TokenExpiredError' || err.name === 'JsonWebTokenError') {
+      return res.status(401).json({ message: 'Invalid or expired refresh token' });
+    }
     next(err);
   }
 };
@@ -201,8 +221,7 @@ export const logoutUser = async (req, res, next) => {
     const refreshTokenHash = hashToken(refreshToken);
     const user = await User.findOne({ 'refreshTokens.tokenHash': refreshTokenHash });
     if (user) {
-      user.refreshTokens = user.refreshTokens.filter((item) => item.tokenHash !== refreshTokenHash);
-      await user.save();
+      await revokeRefreshToken(user, refreshToken);
 
       await recordAudit({
         actorId: user._id,
