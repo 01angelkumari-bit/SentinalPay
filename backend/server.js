@@ -61,9 +61,10 @@ app.get('/', (req, res) => {
 // Centralized Error Handling Middleware
 app.use(errorHandler);
 
-app.listen(PORT, () => {
-  logger.info('server.started', { port: PORT, environment: process.env.NODE_ENV || 'development' });
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server running on port ${PORT}`);
 });
+
 
 process.on('unhandledRejection', (error) => {
   logger.error('unhandled_rejection', { error: error.message });

@@ -17,6 +17,11 @@ const userSchema = new mongoose.Schema({
       expiresAt: { type: Date }
     }
   ],
+  failedLoginAttempts: { type: Number, default: 0 },
+  lockoutUntil: { type: Date },
+  lastLoginIp: { type: String },
+  lastSeenIp: { type: String },
+  lastSeenAt: { type: Date },
   twoFactorEnabled: { type: Boolean, default: false },
   deviceTrustScore: { type: Number, default: 95, min: 0, max: 100 },
   lastLogin: { type: Date },
